@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "7 */12 * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Regenerate even if exchange_calendars version is unchanged"
+        required: false
+        default: "false"
 
 permissions:
   contents: write
@@ -18,20 +23,56 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Check exchange_calendars version
+        id: version
+        run: |
+          latest=$(python - <<'PY'
+          import json
+          import urllib.request
+
+          with urllib.request.urlopen("https://pypi.org/pypi/exchange-calendars/json", timeout=20) as response:
+              data = json.load(response)
+          print(data["info"]["version"])
+          PY
+          )
+
+          current=""
+          if [ -f market-calendar/exchange_calendars.version ]; then
+            current=$(tr -d '[:space:]' < market-calendar/exchange_calendars.version)
+          fi
+
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest exchange_calendars: $latest"
+          echo "stored exchange_calendars: ${current:-<none>}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$latest" != "$current" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install dependencies
+        if: steps.version.outputs.changed == 'true'
         run: pip install -r market-calendar/requirements.txt
 
       - name: Generate market sessions
-        run: python market-calendar/generate_market_sessions.py --output market-sessions.csv --days 730
+        if: steps.version.outputs.changed == 'true'
+        run: |
+          python market-calendar/generate_market_sessions.py --output market-sessions.csv --days 1095
+          printf "%s\n" "${{ steps.version.outputs.latest }}" > market-calendar/exchange_calendars.version
 
       - name: Commit changed calendar
+        if: steps.version.outputs.changed == 'true'
         run: |
-          if git diff --quiet -- market-sessions.csv; then
-            echo "market-sessions.csv is unchanged"
+          if git diff --quiet -- market-sessions.csv market-calendar/exchange_calendars.version; then
+            echo "market-sessions.csv and exchange_calendars.version are unchanged"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add market-sessions.csv
-          git commit -m "Update market sessions"
+          git add market-sessions.csv market-calendar/exchange_calendars.version
+          git commit -m "Update market sessions for exchange_calendars ${{ steps.version.outputs.latest }}"
           git push
